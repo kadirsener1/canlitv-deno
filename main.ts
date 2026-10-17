@@ -1,6 +1,6 @@
 // ============================================================
-// Canlitv Proxy — Deno Deploy
-// Embed scrape + hash cache + segment proxy
+// Canlitv Proxy — Deno Deploy v2
+// Master + nested playlist + hash refresh fix
 // ============================================================
 
 const CANLITV_BASE = "https://www.canlitv.you";
@@ -17,23 +17,18 @@ const DEFAULT_CHANNELS = [
   { id: "12045", name: "Kanal 12045", tvgId: "", group: "Canlitv" },
 ];
 
-// In-memory cache (Deno Deploy isolate süresince geçerli)
 const hashCache: Record<string, any> = {};
 const manifestCache: Record<string, any> = {};
 const pendingFetch: Record<string, Promise<any> | null> = {};
 
 // ------------------------------------------------------------
-// Deno KV (built-in)
+// Deno KV
 // ------------------------------------------------------------
 let kvReady: Promise<Deno.Kv> | null = null;
 async function getKv(): Promise<Deno.Kv | null> {
   if (!kvReady) {
-    try {
-      kvReady = Deno.openKv();
-    } catch (e) {
-      console.error("KV open failed:", e);
-      return null;
-    }
+    try { kvReady = Deno.openKv(); }
+    catch (e) { console.error("KV open failed:", e); return null; }
   }
   try { return await kvReady; }
   catch (e) { console.error("KV await failed:", e); return null; }
@@ -60,7 +55,7 @@ async function saveChannels(channels: any[]): Promise<void> {
 }
 
 // ------------------------------------------------------------
-// Auth helpers
+// Auth
 // ------------------------------------------------------------
 function timingSafeEqual(a: string, b: string): boolean {
   if (typeof a !== "string" || typeof b !== "string") return false;
@@ -111,7 +106,7 @@ async function requireAuth(req: Request): Promise<boolean> {
 }
 
 // ------------------------------------------------------------
-// ID validation
+// Helpers
 // ------------------------------------------------------------
 function isNumericId(s: string): boolean {
   if (typeof s !== "string" || s.length === 0) return false;
@@ -128,8 +123,29 @@ function charCodes(s: string): string {
   return r.join(",");
 }
 
+function isPlaylistUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.pathname.endsWith(".m3u8") || u.pathname.endsWith(".m3u");
+  } catch { return false; }
+}
+
+function cacheKeyForUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return "u:" + u.pathname + "|" + u.search.slice(0, 60);
+  } catch { return "u:" + url.slice(0, 100); }
+}
+
+function jsonResp(obj: any, status = 200): Response {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 // ------------------------------------------------------------
-// Hash scrape from embed HTML
+// Hash scrape
 // ------------------------------------------------------------
 async function fetchFreshHash(channelId: string) {
   const embedUrl = CANLITV_BASE + "/embed/?id=" + channelId;
@@ -157,7 +173,6 @@ async function fetchFreshHash(channelId: string) {
   }
 
   if (!m3u8Url) throw new Error("HTML'de m3u8 bulunamadı: " + embedUrl);
-
   m3u8Url = m3u8Url.replace(/\\\//g, "/");
 
   let hash: string | null = null;
@@ -189,10 +204,30 @@ async function getHash(channelId: string, force = false) {
 }
 
 // ------------------------------------------------------------
-// Manifest proxy
+// URL hash replacement helper
 // ------------------------------------------------------------
-async function proxyM3U8(streamUrl: string, channelId: string, baseOrigin: string): Promise<Response> {
-  const cached = manifestCache[channelId];
+function replaceHashInUrl(originalUrl: string, freshHashUrl: string): string {
+  try {
+    const orig = new URL(originalUrl);
+    const fresh = new URL(freshHashUrl);
+    const newHash = fresh.searchParams.get("hash");
+    const newToken = fresh.searchParams.get("t");
+    const oldHash = orig.searchParams.get("hash");
+    const oldToken = orig.searchParams.get("t");
+    if (newHash && oldHash) orig.searchParams.set("hash", newHash);
+    if (newToken && oldToken) orig.searchParams.set("t", newToken);
+    return orig.href;
+  } catch {
+    return originalUrl;
+  }
+}
+
+// ------------------------------------------------------------
+// Manifest proxy — supports master + nested playlists
+// ------------------------------------------------------------
+async function proxyM3U8(streamUrl: string, channelId: string, baseOrigin: string, cacheKey?: string): Promise<Response> {
+  const key = cacheKey || channelId;
+  const cached = manifestCache[key];
   if (cached && cached.expiresAt > Date.now()) {
     return new Response(cached.body, {
       headers: {
@@ -203,9 +238,26 @@ async function proxyM3U8(streamUrl: string, channelId: string, baseOrigin: strin
     });
   }
 
-  const resp = await fetch(streamUrl, {
+  // Hash'i güncelle (iç playlist'ler için de)
+  let fetchUrl = streamUrl;
+  try {
+    const cache = await getHash(channelId);
+    fetchUrl = replaceHashInUrl(streamUrl, cache.streamUrl);
+  } catch { /* ignore */ }
+
+  let resp = await fetch(fetchUrl, {
     headers: { "Accept": "*/*" },
   });
+
+  // 403 → hash yenile ve tekrar dene
+  if (!resp.ok && (resp.status === 403 || resp.status === 401)) {
+    try {
+      await getHash(channelId, true);
+      const c2 = hashCache[channelId];
+      const retryUrl = replaceHashInUrl(streamUrl, c2.streamUrl);
+      resp = await fetch(retryUrl, { headers: { "Accept": "*/*" } });
+    } catch { /* ignore */ }
+  }
 
   if (!resp.ok) {
     throw new Error("Upstream " + resp.status + " (manifest) | url=" + streamUrl.slice(0, 140));
@@ -249,7 +301,7 @@ async function proxyM3U8(streamUrl: string, channelId: string, baseOrigin: strin
   }
 
   const finalBody = out.join("\n");
-  manifestCache[channelId] = { body: finalBody, expiresAt: Date.now() + MANIFEST_CACHE_MS };
+  manifestCache[key] = { body: finalBody, expiresAt: Date.now() + MANIFEST_CACHE_MS };
 
   return new Response(finalBody, {
     headers: {
@@ -263,21 +315,24 @@ async function proxyM3U8(streamUrl: string, channelId: string, baseOrigin: strin
 // ------------------------------------------------------------
 // Segment proxy
 // ------------------------------------------------------------
-async function fetchSegment(originalUrl: string): Promise<Response> {
-  return await fetch(originalUrl, {
-    headers: { "Accept": "*/*" },
-  });
+async function fetchSegment(url: string): Promise<Response> {
+  return await fetch(url, { headers: { "Accept": "*/*" } });
 }
 
 async function handleSegment(channelId: string, originalUrl: string): Promise<Response> {
-  await getHash(channelId);
+  const cache = await getHash(channelId);
 
-  let resp = await fetchSegment(originalUrl);
+  // Hash güncelle
+  let url = replaceHashInUrl(originalUrl, cache.streamUrl);
+
+  let resp = await fetchSegment(url);
 
   if (!resp.ok && (resp.status === 403 || resp.status === 401 || resp.status === 404)) {
     try {
       await getHash(channelId, true);
-      resp = await fetchSegment(originalUrl);
+      const c2 = hashCache[channelId];
+      url = replaceHashInUrl(originalUrl, c2.streamUrl);
+      resp = await fetchSegment(url);
     } catch { /* ignore */ }
   }
 
@@ -308,19 +363,15 @@ function buildM3U(channels: any[], baseOrigin: string): string {
 }
 
 // ------------------------------------------------------------
-// Admin API
+// Admin
 // ------------------------------------------------------------
 async function handleLogin(req: Request): Promise<Response> {
   const pass = Deno.env.get("ADMIN_PASSWORD");
-  if (!pass) {
-    return jsonResp({ error: "ADMIN_PASSWORD ayarlanmamış" }, 500);
-  }
+  if (!pass) return jsonResp({ error: "ADMIN_PASSWORD ayarlanmamış" }, 500);
   let body: any;
   try { body = await req.json(); } catch { body = {}; }
   const password = body.password || "";
-  if (!timingSafeEqual(password, pass)) {
-    return jsonResp({ error: "Yanlış şifre" }, 401);
-  }
+  if (!timingSafeEqual(password, pass)) return jsonResp({ error: "Yanlış şifre" }, 401);
   const session = await createSession(pass);
   const maxAge = Math.floor(SESSION_TTL_MS / 1000);
   return new Response(JSON.stringify({ ok: true }), {
@@ -343,8 +394,7 @@ function handleLogout(): Response {
 }
 
 async function handleListChannels(): Promise<Response> {
-  const channels = await getChannels();
-  return jsonResp(channels);
+  return jsonResp(await getChannels());
 }
 
 async function handleSaveChannels(req: Request): Promise<Response> {
@@ -384,18 +434,11 @@ async function handleSaveChannels(req: Request): Promise<Response> {
     }));
 
     await saveChannels(cleaned);
-    for (const id of idMap.keys()) { delete manifestCache[id]; delete hashCache[id]; }
+    for (const id of idMap.keys()) { delete hashCache[id]; }
     return jsonResp({ ok: true, count: cleaned.length });
   } catch (e: any) {
     return jsonResp({ error: "Sunucu hatası: " + e.message }, 500);
   }
-}
-
-function jsonResp(obj: any, status = 200): Response {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
 }
 
 // ------------------------------------------------------------
@@ -617,10 +660,22 @@ async function handler(req: Request): Promise<Response> {
     }
   }
 
+  // ⭐ KRİTİK: /seg — eğer URL m3u8 ise nested manifest olarak işle
   if (path === "/seg") {
     const c = url.searchParams.get("c");
     const u = url.searchParams.get("u");
     if (!c || !u) return new Response("Missing params", { status: 400 });
+
+    if (isPlaylistUrl(u)) {
+      // Nested playlist → manifest olarak proxy'le (kendi cache key ile)
+      try {
+        return await proxyM3U8(u, c, baseOrigin, cacheKeyForUrl(u));
+      } catch (e: any) {
+        return new Response("Nested manifest error: " + e.message, { status: 502 });
+      }
+    }
+
+    // Normal segment (.ts, .aac, .key vb.)
     try { return await handleSegment(c, u); }
     catch (e: any) { return new Response("Segment error: " + e.message, { status: 502 }); }
   }
@@ -644,7 +699,8 @@ async function handler(req: Request): Promise<Response> {
     const c = url.searchParams.get("c") || (channels[0] && channels[0].id);
     try {
       await getHash(c, true);
-      delete manifestCache[c];
+      // İlgili manifest cache'leri temizle
+      for (const k of Object.keys(manifestCache)) delete manifestCache[k];
       return jsonResp({
         ok: true,
         channelId: c,
@@ -657,7 +713,7 @@ async function handler(req: Request): Promise<Response> {
   }
 
   return new Response(
-    "Canlitv Proxy (Deno)\n\nPublic:\n- /playlist.m3u\n- /play/<id>\n- /status\n- /refresh?c=<id>\n\nAdmin:\n- /admin\n- /api/admin/debug\n",
+    "Canlitv Proxy (Deno) v2\n\nPublic:\n- /playlist.m3u\n- /play/<id>\n- /status\n- /refresh?c=<id>\n\nAdmin:\n- /admin\n- /api/admin/debug\n",
     { status: 404, headers: { "Content-Type": "text/plain" } }
   );
 }
